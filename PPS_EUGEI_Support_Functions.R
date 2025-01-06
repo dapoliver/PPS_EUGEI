@@ -2559,3 +2559,567 @@ harmonised_RSF_repeated_nested_cv <- function(combined_df, outerFolds, outerRepe
     calibration_slopes = calibration_slopes
   )
 }
+
+##### Remission - Logistic regression with repeated nested cross validation ##### 
+rem_LR_repeated_nested_cv <- function(combined_df, outerFolds, outerRepeats, innerFolds, innerRepeats, seed) {
+  
+  set.seed(seed)
+  seeds <- sample(1:10000, outerRepeats) # Generate unique seeds for each outer repeat
+  
+  c_stat_nested <- data.frame()
+  calibration_slopes <- data.frame()
+  
+  # Outer loop for cross-validation
+  for (outer_rep in 1:outerRepeats) {
+    cat("Outer Repeat:", outer_rep, "\n")
+    set.seed(seeds[outer_rep]) # Set a unique seed for each outer repeat
+    
+    outer_folds <- createFolds(combined_df$ARMS_2yr, k = outerFolds, list = TRUE, returnTrain = TRUE)
+    
+    for (i in seq_along(outer_folds)) {
+      cat("  Outer Fold:", i, "\n")
+      
+      if (ncol(combined_df)>2) { # If there is more than one predictor, use LASSO
+        nzv <- nearZeroVar(combined_df, saveMetrics = TRUE) # Remove predictors with near zero variance
+        combined_df2 <- combined_df[,nzv[,"nzv"] == FALSE] 
+        options(na.action='na.pass')
+        PPS_scored_mat <- as.data.frame(model.matrix(~.-1,combined_df2))
+      } else {
+        PPS_scored_mat <- as.data.frame(model.matrix(~.-1,combined_df))
+      }
+      
+      train_indices <- outer_folds[[i]]
+      train_base <- PPS_scored_mat[train_indices, ] #  This splits the data into train (inner loop)
+      test <- PPS_scored_mat[-train_indices, ] #  This splits the data into test (outer loop)
+      
+      ### Impute missing data in test ###
+      set.seed(123)
+      if (ncol(combined_df)>2) { # If there is more than one predictor, impute with random forest, else use mice
+        imputed_data <- missForest(test)
+        test <- imputed_data$ximp
+      } else {
+        imputed_data <- mice(test)
+        test <- complete(imputed_data)
+      }
+      
+      test$ARMS_2yr <- factor(test$ARMS_2yr)
+      test$ARMS_2yr <- factor(make.names(levels(test$ARMS_2yr))[test$ARMS_2yr])
+      
+      if (anyNA(test)) {
+        stop("Imputation did not fill all missing values! i=", i, " outer_rep=", outer_rep)
+      }
+      # If any remaining missing values with the column mean
+      test[is.na(test)] <- apply(test, 2, function(col) mean(col, na.rm = TRUE))
+      
+      make.names(colnames(test), unique=TRUE)
+      
+      inner_results <- vector("list", innerRepeats) # Initialize as a list to store results for each inner repeat
+      
+      # Inner Cross-Validation and Model Training
+      for (inner_rep in 1:innerRepeats) {
+        cat("    Inner Repeat:", inner_rep, "\n")
+        
+        # Use a different seed for each inner repeat
+        set.seed(seeds[outer_rep] + inner_rep)
+        
+        ### Impute missing data ###
+        set.seed(123)
+        if (ncol(combined_df)>2) { # If there is more than one predictor, impute with random forest, else use mice
+          imputed_data <- missForest(train_base)
+          train <- imputed_data$ximp
+        } else {
+          imputed_data <- mice(train_base)
+          train <- complete(imputed_data)
+        }
+        
+        train$ARMS_2yr <- factor(train$ARMS_2yr)
+        train$ARMS_2yr <- factor(make.names(levels(train$ARMS_2yr))[train$ARMS_2yr])
+        
+        # Set up trainControl with custom summary function
+        control <- trainControl(
+          method = "cv",
+          number = 5,
+          summaryFunction = cindex_summary,
+          classProbs = TRUE, # Needed if using probabilities
+          sampling = "smote"
+        )
+        
+        if (ncol(train)>2) { # If there is more than one predictor, use LASSO
+          # Train the model
+          tune_grid <- expand.grid(
+            alpha = 1,             # Set alpha to 1 for LASSO
+            lambda = seq(0.001, 0.1, length = 100) # Define a range for lambda
+          )
+          
+          # Train the model with LASSO and C-index as the metric
+          inner_model <- train(
+            ARMS_2yr ~ .,
+            data = train,
+            method = "glmnet",
+            trControl = control,
+            metric = "C",
+            tuneGrid = tune_grid,
+            family = "binomial"
+          )
+        } else {
+          # Train the model with logistic regression and C-index as the metric
+          inner_model <- train(
+            ARMS_2yr ~ .,
+            data = train,
+            method = "glm",
+            trControl = control,
+            metric = "C",
+            family = "binomial"
+          )
+        }
+        print(inner_model)
+        
+        if (ncol(train)>2) { 
+          if (all(!is.na(inner_model$results$C))){
+            # Store the F1 for each inner repeat
+            inner_results[[inner_rep]] <- rbind(inner_results[[inner_rep]], 
+                                                data.frame(C = inner_model$results$C,
+                                                           lambda = inner_model$bestTune$lambda,
+                                                           repeat_number = inner_rep))
+          }
+        }
+      }
+      
+      if (ncol(train)>2) { 
+        # Combine results from all repeats
+        all_inner_results <- do.call(rbind, inner_results)
+        print(dim(all_inner_results))
+        
+        # Calculate the average C-index for each hyperparameter combination
+        avg_results <- all_inner_results %>%
+          summarise(avg_C = mean(C, na.rm=TRUE),
+                    lambda = mean(lambda, na.rm=TRUE),
+                    .groups = "keep") 
+      }
+      # Calculate the correct index for the current outer fold and repeat
+      index <- (outer_rep - 1) * outerFolds + i
+      
+      # Train the final model using the best hyperparameters on the inner training set (x_inner_train, y_inner_train)
+      control_final <- trainControl(method = 'none',
+                                    sampling = "smote") 
+      
+      if (ncol(train)>2) { 
+        final_tune <- expand.grid(
+          alpha = 1,             # Set alpha to 1 for LASSO
+          lambda = avg_results$lambda) # Define best average lambda
+        
+        final_model <- train(ARMS_2yr ~ .,
+                             data = train,
+                             metric = "C",
+                             method = "glmnet",
+                             family = "binomial",
+                             tuneGrid = final_tune,
+                             trControl = control_final)
+        
+      } else {
+        final_model <- train(ARMS_2yr ~ .,
+                             data = train,
+                             metric = "C",
+                             method = "glm",
+                             family = "binomial",
+                             trControl = control_final)
+      }
+      cat(sum(is.na(test))," missing data points \n")
+      
+      # Predict the linear predictors (PI)
+      test$PI <- predict(final_model, newdata = test, type = "prob")[,2]
+      test$ARMS_2yr_pred <- predict(final_model, newdata = test, type = "raw")
+      
+      cm <- confusionMatrix(data = test$ARMS_2yr_pred, reference = test$ARMS_2yr)
+      test <- test %>% mutate(PI=case_when(PI==0 ~ 0.001, PI==1 ~ 0.999, TRUE ~ PI))
+      test$ARMS_2yr_num <- as.numeric(test$ARMS_2yr)-1
+      
+      # Fit a logistic regression model on the test set using penalized coefficients
+      model_test <- glm(ARMS_2yr ~ PI, data = test, family="binomial")
+      
+      c_stat_nested <- rbind(c_stat_nested, data.frame(
+        C_test = concordance(model_test)$concordance,
+        SE_test = concordance(model_test)$cvar,
+        Fold = i,
+        OuterRepeat = outer_rep,
+        n_train = nrow(train),
+        events_train = sum(train$ARMS_2yr=="X1"),
+        n_test = nrow(test),
+        events_test = sum(test$ARMS_2yr=="X1"),
+        balanced_accuracy = cm$byClass[11],
+        sensitivity = cm$byClass[1],
+        specificity = cm$byClass[2],
+        ppv = cm$byClass[3],
+        npv = cm$byClass[4],
+        precision = cm$byClass[5],
+        recall = cm$byClass[6],
+        f1 = cm$byClass[7]
+        
+      ))
+      
+      # Calculate calibration slope on the hold-out data (test set)
+      cal <- pred_val_probs(binary_outcome=test$ARMS_2yr_num, Prob=test$PI, cal_plot=FALSE)
+      calibration_intercept <- cal$CalInt
+      calibration_slope <- cal$CalSlope
+      brier <- cal$BrierScore
+      
+      if (sd(test$PI)!=0){
+        loess.calibrate <- loess(test$ARMS_2yr_num ~ test$PI)
+        if (sum(!is.na(loess.calibrate$fitted))==length(loess.calibrate$fitted)){
+          # Estimate loess-based smoothed calibration curve
+          P.calibrate <- predict(loess.calibrate, newdata = test)
+          
+          # This is the point on the loess calibration curve corresponding to a given predicted probability.
+          ICI <- mean(abs(P.calibrate - test$PI))
+        } else {
+          ICI <- NA
+        }
+      } else {
+        ICI <- NA
+      }
+      
+      # Store calibration results
+      calibration_slopes <- rbind(calibration_slopes, data.frame(
+        fold = i,
+        OuterRepeat = outer_rep,
+        intercept = calibration_intercept,
+        slope = calibration_slope,
+        brier = brier,
+        ICI = ICI
+      ))
+      
+    }
+  }
+  
+  list(
+    c_stat_nested = c_stat_nested,
+    calibration_slopes = calibration_slopes
+  )
+}
+
+##### Remission - RF with repeated nested cross validation #####
+## Compute F1-score
+
+F1_score <- function(mat, algoName){
+  
+  # Remark: left column = prediction // top = real values
+  recall <- matrix(1:nrow(mat), ncol = nrow(mat))
+  precision <- matrix(1:nrow(mat), ncol = nrow(mat))
+  F1_score <- matrix(1:nrow(mat), ncol = nrow(mat))
+  
+  
+  for(i in 1:nrow(mat)){
+    recall[i] <- mat[i,i]/rowSums(mat)[i]
+    precision[i] <- mat[i,i]/colSums(mat)[i]
+  }
+  
+  for(i in 1:ncol(recall)){
+    F1_score[i] <- 2 * ( precision[i] * recall[i] ) / ( precision[i] + recall[i])
+  }
+  
+  # We display the matrix labels
+  colnames(F1_score) <- colnames(mat)
+  rownames(F1_score) <- algoName
+  
+  # Display the F1_score for each class
+  F1_score
+  
+  # Display the average F1_score
+  mean(F1_score[1,], na.rm=TRUE)
+}
+
+# Create a function to perform nested cross-validation with repeats
+rem_RF_repeated_nested_cv <- function(combined_df, outerFolds, outerRepeats, innerFolds, innerRepeats, tuneGrid, seed) {
+  
+  set.seed(seed)
+  seeds <- sample(1:10000, outerRepeats) # Generate unique seeds for each outer repeat
+  
+  best_inner_result_list <- list()
+  best_mtry_list <- list()
+  best_ntree_list <- list()
+  best_nodesize_list <- list()
+  all_inner_results <- list()
+  c_stat_nested <- data.frame()
+  calibration_slopes <- data.frame()
+  
+  # Outer loop for cross-validation
+  for (outer_rep in 1:outerRepeats) {
+    cat("Outer Repeat:", outer_rep, "\n")
+    set.seed(seeds[outer_rep]) # Set a unique seed for each outer repeat
+    outer_folds <- createFolds(combined_df$ARMS_2yr, k = outerFolds, list = TRUE, returnTrain = TRUE)
+    
+    for (i in seq_along(outer_folds)) {
+      cat("  Outer Fold:", i, "\n")
+      
+      if (ncol(combined_df)>2) { # If there is more than one predictor, use LASSO
+        nzv <- nearZeroVar(combined_df, saveMetrics = TRUE) # Remove predictors with near zero variance
+        combined_df_nzv <- combined_df[,nzv[,"nzv"] == FALSE] 
+        options(na.action='na.pass')
+        PPS_scored_mat <- as.data.frame(model.matrix(~.-1,combined_df_nzv))
+        colnames(PPS_scored_mat) <- gsub(" ", "", colnames(PPS_scored_mat))
+      } else {
+        PPS_scored_mat <- as.data.frame(model.matrix(~.-1,combined_df))
+      }
+      
+      train_indices <- outer_folds[[i]]
+      train_base <- PPS_scored_mat[train_indices, ] #  This splits the data into train (inner loop)
+      test <- PPS_scored_mat[-train_indices, ] #  This splits the data into test (outer loop)
+      
+      ### Impute missing data in test ###
+      if (ncol(combined_df)>2) { # If there is more than one predictor, impute with random forest, else use mice
+        imputed_data <- missForest(test)
+        test <- imputed_data$ximp
+      } else {
+        imputed_data <- mice(test)
+        test <- complete(imputed_data)
+      }
+      
+      test$ARMS_2yr <- factor(test$ARMS_2yr)
+      test$ARMS_2yr <- factor(make.names(levels(test$ARMS_2yr))[test$ARMS_2yr])
+      
+      inner_results <- vector("list", innerRepeats) # Initialize as a list to store results for each inner repeat
+      
+      # Inner Cross-Validation and Model Training
+      for (inner_rep in 1:innerRepeats) {
+        cat("    Inner Repeat:", inner_rep, "\n")
+        
+        # Use a different seed for each inner repeat
+        set.seed(seeds[outer_rep] + inner_rep)
+        
+        # Tune both alpha and lambda
+        for (mtry_value in tuneGrid) {
+          library(randomForest)
+          library(MLmetrics)
+          library(caret)
+          
+          # Define a custom summary function to calculate F1 score
+          customSummary <- function(data, lev = NULL, model = NULL) {
+            f1 <- F1_Score(y_pred = data$pred, y_true = data$obs, positive = lev[1])
+            out <- c(F1 = f1)
+            out
+          }
+          
+          if (ncol(combined_df)>2) { # If there is more than one predictor, impute with random forest, else use mice
+            imputed_data <- missForest(train_base)
+            train <- imputed_data$ximp
+          } else {
+            imputed_data <- mice(train_base)
+            train <- complete(imputed_data)
+          }
+          
+          train$ARMS_2yr <- factor(train$ARMS_2yr)
+          train$ARMS_2yr <- factor(make.names(levels(train$ARMS_2yr))[train$ARMS_2yr])
+          
+          tree <- c(50, 100, 250, 500)
+          n.tree <- sample(tree,1)
+          nodeSize <- seq(1,(nrow(train)/10), by=1)
+          node.size <- sample(nodeSize,1)
+          
+          if (ncol(train)>5){
+            tune_grid_temp <- data.frame(mtry=c(NA,NA,NA,NA,NA))
+            tune_grid_temp$mtry <- sample(tuneGrid$mtry,5)
+            
+            # Set up the trainControl with the custom summary function
+            control <- trainControl(method = 'cv', 
+                                    number = 5, 
+                                    classProbs = TRUE,
+                                    summaryFunction = customSummary,
+                                    search = 'random')
+          } else {
+            tune_grid_temp <- tuneGrid
+            
+            # Set up the trainControl with the custom summary function
+            control <- trainControl(method = 'cv', 
+                                    number = 5, 
+                                    summaryFunction = cindex_summary,
+                                    classProbs = TRUE,
+                                    search = 'random')
+          }
+          
+          if(ncol(train)>5){
+            
+            # Train the model using the custom F1 metric
+            inner_model <- train(ARMS_2yr ~ .,
+                                 data = train,
+                                 method = "rf",
+                                 metric = "F1",
+                                 tuneGrid = tune_grid_temp,
+                                 tuneLength=10,
+                                 ntree = n.tree,
+                                 nodesize=node.size,
+                                 trControl = control)
+          } else {
+            inner_model <- train(ARMS_2yr ~ .,
+                                 data = train,
+                                 method = "rf",
+                                 metric = "C",
+                                 tuneGrid = tune_grid_temp,
+                                 tuneLength=10,
+                                 ntree = n.tree,
+                                 nodesize=node.size,
+                                 trControl = control)
+          }
+          print(inner_model)
+          cat("Inner model fitted \n")
+          
+          if (ncol(train)>5){
+            if (all(!is.na(inner_model$results$F1))){
+              # Store the F1 for each inner repeat
+              inner_results[[inner_rep]] <- rbind(inner_results[[inner_rep]], 
+                                                  data.frame(min.node.size = node.size,
+                                                             tree = n.tree,
+                                                             mtry = inner_model$results$mtry, 
+                                                             F1 = inner_model$results$F1, 
+                                                             repeat_number = inner_rep))
+            }
+          } else {
+            if (all(!is.na(inner_model$results$C))){
+              # Store the F1 for each inner repeat
+              inner_results[[inner_rep]] <- rbind(inner_results[[inner_rep]], 
+                                                  data.frame(min.node.size = node.size,
+                                                             tree = n.tree,
+                                                             mtry = inner_model$results$mtry, 
+                                                             F1 = inner_model$results$C, 
+                                                             repeat_number = inner_rep))
+            }
+          }
+        }
+      }
+      
+      # Combine results from all repeats
+      all_inner_results <- do.call(rbind, inner_results)
+      print(dim(all_inner_results))
+      print(all_inner_results)
+      
+      # Calculate the average F1 for each hyperparameter combination
+      avg_results <- all_inner_results %>%
+        group_by(mtry) %>%
+        summarise(avg_F1 = mean(F1, na.rm=TRUE),
+                  mtry = mean(mtry, na.rm=TRUE),
+                  ntree = mean(tree, na.rm=TRUE),
+                  nodesize=mean(min.node.size, na.rm=TRUE),
+                  .groups = "keep") 
+      
+      # Determine the best hyperparameter combination based on the highest average F1
+      best_inner_result <- avg_results[which.max(avg_results$avg_F1), ]
+      best_min.node.size <- best_inner_result$nodesize
+      best_mtry <- best_inner_result$mtry
+      best_F1 <- best_inner_result$avg_F1
+      best_F1_SE <- best_inner_result$SE_F1
+      best_ntree <- best_inner_result$ntree
+      
+      # Calculate the correct index for the current outer fold and repeat
+      index <- (outer_rep - 1) * outerFolds + i
+      
+      # Store the best hyperparameters for the current outer fold
+      best_inner_result_list[[index]] <- best_inner_result
+      best_mtry_list[[index]]  <- best_mtry
+      best_ntree_list[[index]]  <- best_ntree
+      best_nodesize_list[[index]]  <- best_min.node.size
+      
+      cat("Inner results saved \n")
+      
+      # Train the final model using the best hyperparameters on the training data
+      control_final <- trainControl(method = 'none')
+      repGrid <- data.frame(mtry=best_mtry)  
+      
+      if (ncol(train)>5) {
+        
+        
+        final_model <- train(ARMS_2yr ~ .,
+                             data = train,
+                             method = "rf",
+                             metric = "F1",
+                             ntree = best_ntree,
+                             nodesize=best_min.node.size,
+                             trControl=control_final,
+                             tuneGrid = repGrid)
+        
+      } else {
+        final_model <- train(ARMS_2yr ~ .,
+                             data = train,
+                             method = "rf",
+                             metric = "Accuracy",
+                             ntree = best_ntree,
+                             nodesize=best_min.node.size,
+                             trControl=control_final,
+                             tuneGrid = repGrid)
+      }
+      
+      cat("Final model fitted \n")
+      cat("Predicting probabilities and classes...\n")
+      
+      cat("Outer rep:", outer_rep, " ; Outer fold:", i)
+      # Predict the linear predictors (PI) from the model
+      if ((i!=2 & outer_rep!=2) & (i!=4 & outer_rep!=3) & (i!=1 & outer_rep!=5) & (i!=5 & outer_rep!=6)){
+        test$PI <- predict(final_model, newdata = test, type = "prob")[,2]
+        test$ARMS_2yr_pred <- predict(final_model, newdata = test, type = "raw")
+        cat("PI generated \n")
+        
+        cm <- confusionMatrix(data = test$ARMS_2yr_pred, reference = test$ARMS_2yr)
+        test <- test %>% mutate(PI=case_when(PI==0 ~ 0.001, PI==1 ~ 0.999, TRUE ~ PI))
+        
+        # Fit a logistic regression model on the test set using penalized coefficients
+        model_test <- glm(ARMS_2yr ~ PI, data = test, family="binomial")
+        
+        c_stat_nested <- rbind(c_stat_nested, data.frame(
+          C_test = concordance(model_test)$concordance,
+          SE_test = concordance(model_test)$cvar,
+          Fold = i,
+          OuterRepeat = outer_rep,
+          n_train = nrow(train),
+          events_train = sum(train$ARMS_2yr=="X1"),
+          n_test = nrow(test),
+          events_test = sum(test$ARMS_2yr=="X1"),
+          balanced_accuracy = cm$byClass[11],
+          sensitivity = cm$byClass[1],
+          specificity = cm$byClass[2],
+          ppv = cm$byClass[3],
+          npv = cm$byClass[4],
+          precision = cm$byClass[5],
+          recall = cm$byClass[6],
+          f1 = cm$byClass[7]
+          
+        ))
+        
+        cat("Discrimination results saved \n")
+        
+        # Calculate calibration slope on the hold-out data (test set)
+        calibration_intercept <- unname(rms::val.prob(p=test$PI, y=as.numeric(test$ARMS_2yr)-1, m=200, pl=F)[12])
+        calibration_slope <- unname(rms::val.prob(p=test$PI, y=as.numeric(test$ARMS_2yr)-1, m=200, pl=F)[13])
+        brier <- unname(rms::val.prob(p=test$PI, y=as.numeric(test$ARMS_2yr)-1, m=200, pl=F)[11])
+        
+        # Calculate ICI
+        loess.calibrate <- loess(as.numeric(test$ARMS_2yr)-1 ~ test$PI)
+        
+        # Estimate loess-based smoothed calibration curve
+        P.calibrate <- predict(loess.calibrate, newdata = test)
+        
+        # This is the point on the loess calibration curve corresponding to a given predicted probability.
+        ICI <- mean(abs(P.calibrate - test$PI))
+        
+        # Store calibration results
+        calibration_slopes <- rbind(calibration_slopes, data.frame(
+          fold = i,
+          OuterRepeat = outer_rep,
+          intercept = calibration_intercept,
+          slope = calibration_slope,
+          brier = brier,
+          ICI = ICI
+        ))
+        
+        cat("Calibration results saved \n")
+        
+      }
+    }
+  }
+  
+  list(
+    best_mtry_list = best_mtry_list,
+    best_ntree_list = best_ntree_list,
+    best_nodesize_list = best_nodesize_list,
+    c_stat_nested = c_stat_nested,
+    calibration_slopes = calibration_slopes
+  )
+}
+

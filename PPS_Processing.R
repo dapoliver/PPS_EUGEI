@@ -171,8 +171,8 @@ PPS_all <- PPS_all %>% subset(select = c(-Age, -Male, -Ethnicity, -Low_ethnic_de
 write_csv(PPS_all,"~/Dropbox/Work/PPS/EU-GEI/Databases/PPS_processed.csv")
 
 # Visualise data missingness
-PPS_missing <- PPS_all %>% subset(select=c(Age, Male, Handedness, Urbanicity, Pollution, Ethnicity, 
-                                           High_ethnic_density, FirstGenImmigrantNA, 
+PPS_missing <- PPS_all %>% subset(select=c(Gender, Handedness, Urbanicity, Pollution, Ethnicity_ED, 
+                                          FirstGenImmigrantNA, 
                                            FirstGenImmigrant, SecondGenImmigrantNA, SecondGenImmigrant,  
                                            PaternalSES, Parental_SMI, AdultLifeEvents,
                                            Tobacco, Cannabis,  
